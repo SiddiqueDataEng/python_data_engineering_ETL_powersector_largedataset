@@ -18,7 +18,9 @@ from datetime import datetime
 import time
 import os
 import numpy as np
+import threading
 from etl_pipeline import PowerSectorETL
+from etl_pipeline_with_logging import PowerSectorETLWithLogging
 
 # Page configuration
 st.set_page_config(
@@ -87,13 +89,16 @@ st.markdown("""
 
 # Initialize session state
 if 'source_path' not in st.session_state:
-    st.session_state.source_path = r"\\counter2\E\iesco\power_sector_data"
+    st.session_state.source_path = r"\\counter2\E\iesco\power_sector_data_bronze_layer"
 
 if 'target_path' not in st.session_state:
     st.session_state.target_path = "power_sector_data_silver_layer"
 
 if 'etl' not in st.session_state:
     st.session_state.etl = None
+
+if 'etl_with_logging' not in st.session_state:
+    st.session_state.etl_with_logging = None
 
 if 'processing' not in st.session_state:
     st.session_state.processing = False
@@ -103,6 +108,39 @@ if 'last_run' not in st.session_state:
 
 if 'source_cache' not in st.session_state:
     st.session_state.source_cache = {}
+
+if 'etl_logs' not in st.session_state:
+    st.session_state.etl_logs = []
+
+if 'etl_thread' not in st.session_state:
+    st.session_state.etl_thread = None
+
+if 'checkpoint_exists' not in st.session_state:
+    st.session_state.checkpoint_exists = False
+
+
+def safe_compute(df_or_series):
+    """Safely compute Dask objects or return Pandas objects as-is"""
+    if hasattr(df_or_series, 'compute'):
+        return df_or_series.compute()
+    return df_or_series
+
+
+def log_callback(message, level='info'):
+    """Callback function to capture ETL logs"""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    log_entry = f"[{timestamp}] {message}"
+    st.session_state.etl_logs.append(log_entry)
+    # Keep only last 500 logs
+    if len(st.session_state.etl_logs) > 500:
+        st.session_state.etl_logs = st.session_state.etl_logs[-500:]
+
+
+def check_checkpoint():
+    """Check if checkpoint exists"""
+    target_path = Path(st.session_state.target_path)
+    checkpoint_file = target_path / "etl_checkpoint.json"
+    return checkpoint_file.exists()
 
 
 @st.cache_data(ttl=300)
@@ -314,6 +352,11 @@ with st.sidebar.expander("⚙️ Configuration", expanded=False):
             source_dir=new_source,
             target_dir=new_target
         )
+        st.session_state.etl_with_logging = PowerSectorETLWithLogging(
+            source_dir=new_source,
+            target_dir=new_target,
+            log_callback=log_callback
+        )
         st.success("✅ Configuration saved!")
         st.rerun()
 
@@ -323,6 +366,16 @@ if st.session_state.etl is None:
         source_dir=st.session_state.source_path,
         target_dir=st.session_state.target_path
     )
+
+if st.session_state.etl_with_logging is None:
+    st.session_state.etl_with_logging = PowerSectorETLWithLogging(
+        source_dir=st.session_state.source_path,
+        target_dir=st.session_state.target_path,
+        log_callback=log_callback
+    )
+
+# Check for checkpoint
+st.session_state.checkpoint_exists = check_checkpoint()
 
 # Navigation
 st.sidebar.markdown("---")
@@ -334,6 +387,7 @@ page = st.sidebar.radio(
         "📊 Data Quality",
         "📈 Processed EDA",
         "🚀 Run ETL",
+        "📋 View Logs",
         "📅 Scheduler",
         "✅ Validation"
     ]
@@ -932,22 +986,22 @@ elif page == "📈 Processed EDA":
                 with col1:
                     st.metric("Total Records", f"{len(bills_df):,}")
                 with col2:
-                    st.metric("Unique Meters", f"{bills_df['meter_id'].nunique().compute():,}")
+                    st.metric("Unique Meters", f"{safe_compute(bills_df['meter_id'].nunique()):,}")
                 with col3:
-                    st.metric("Divisions", bills_df['division'].nunique().compute())
+                    st.metric("Divisions", safe_compute(bills_df['division'].nunique()))
                 with col4:
-                    st.metric("Subdivisions", bills_df['subdivision'].nunique().compute())
+                    st.metric("Subdivisions", safe_compute(bills_df['subdivision'].nunique()))
                 
                 # Sample data
                 st.markdown("---")
                 st.markdown("**Sample Data:**")
-                st.dataframe(bills_df.head(20).compute(), use_container_width=True)
+                st.dataframe(safe_compute(bills_df.head(20)), use_container_width=True)
                 
                 # Revenue analysis
                 st.markdown("---")
                 st.subheader("💰 Revenue Analysis")
                 
-                revenue_by_div = bills_df.groupby('division')['total_amount'].sum().compute().sort_values(ascending=False)
+                revenue_by_div = safe_compute(bills_df.groupby('division')['total_amount'].sum()).sort_values(ascending=False)
                 
                 fig = px.bar(
                     x=revenue_by_div.index,
@@ -963,7 +1017,7 @@ elif page == "📈 Processed EDA":
                 st.markdown("---")
                 st.subheader("⚡ Consumption Analysis")
                 
-                sample = bills_df.sample(frac=0.1).compute()
+                sample = safe_compute(bills_df.sample(frac=0.1))
                 
                 fig = px.histogram(
                     sample,
@@ -978,7 +1032,7 @@ elif page == "📈 Processed EDA":
                 st.markdown("---")
                 st.subheader("💳 Payment Status")
                 
-                status_counts = bills_df['status'].value_counts().compute()
+                status_counts = safe_compute(bills_df['status'].value_counts())
                 
                 fig = px.pie(
                     values=status_counts.values,
@@ -1001,22 +1055,22 @@ elif page == "📈 Processed EDA":
                 with col1:
                     st.metric("Total Records", f"{len(readings_df):,}")
                 with col2:
-                    st.metric("Unique Meters", f"{readings_df['meter_id'].nunique().compute():,}")
+                    st.metric("Unique Meters", f"{safe_compute(readings_df['meter_id'].nunique()):,}")
                 with col3:
-                    st.metric("Divisions", readings_df['division'].nunique().compute())
+                    st.metric("Divisions", safe_compute(readings_df['division'].nunique()))
                 with col4:
-                    st.metric("Subdivisions", readings_df['subdivision'].nunique().compute())
+                    st.metric("Subdivisions", safe_compute(readings_df['subdivision'].nunique()))
                 
                 # Sample data
                 st.markdown("---")
                 st.markdown("**Sample Data:**")
-                st.dataframe(readings_df.head(20).compute(), use_container_width=True)
+                st.dataframe(safe_compute(readings_df.head(20)), use_container_width=True)
                 
                 # Voltage analysis
                 st.markdown("---")
                 st.subheader("⚡ Voltage Quality Analysis")
                 
-                sample = readings_df.sample(frac=0.05).compute()
+                sample = safe_compute(readings_df.sample(frac=0.05))
                 
                 col1, col2 = st.columns(2)
                 
@@ -1043,7 +1097,7 @@ elif page == "📈 Processed EDA":
                 st.markdown("---")
                 st.subheader("🏷️ Data Quality Flags")
                 
-                quality_counts = readings_df['quality_flag'].value_counts().compute()
+                quality_counts = safe_compute(readings_df['quality_flag'].value_counts())
                 
                 fig = px.pie(
                     values=quality_counts.values,
@@ -1057,8 +1111,27 @@ elif page == "📈 Processed EDA":
 
 elif page == "🚀 Run ETL":
     st.title("🚀 Run ETL Pipeline")
-    st.markdown("Execute data processing pipeline")
+    st.markdown("Execute data processing pipeline with real-time logging")
     st.markdown("---")
+    
+    # Check for checkpoint
+    if st.session_state.checkpoint_exists and not st.session_state.processing:
+        st.markdown('<div class="warning-box">⚠️ <strong>Checkpoint Detected!</strong> Previous ETL run was interrupted. You can resume from where it left off.</div>', unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🔄 Resume from Checkpoint", type="primary", use_container_width=True):
+                st.session_state.resume_mode = True
+        with col2:
+            if st.button("🆕 Start Fresh", use_container_width=True):
+                # Clear checkpoint
+                checkpoint_file = Path(st.session_state.target_path) / "etl_checkpoint.json"
+                if checkpoint_file.exists():
+                    checkpoint_file.unlink()
+                st.session_state.checkpoint_exists = False
+                st.rerun()
+        
+        st.markdown("---")
     
     # ETL configuration
     col1, col2 = st.columns(2)
@@ -1077,48 +1150,284 @@ elif page == "🚀 Run ETL":
             help="Snappy: Fast | Gzip: Balanced | Brotli: Best compression"
         )
     
+    # Store configuration in session state for thread access
+    if 'etl_mode' not in st.session_state:
+        st.session_state.etl_mode = mode
+    if 'etl_compression' not in st.session_state:
+        st.session_state.etl_compression = compression
+    
     st.markdown("---")
     
+    # Control buttons
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        if not st.session_state.processing:
+            resume_mode = st.session_state.get('resume_mode', False)
+            button_label = "🔄 Resume Processing" if resume_mode else "▶️ Start Processing"
+            if st.button(button_label, type="primary", use_container_width=True):
+                st.session_state.processing = True
+                st.session_state.etl_logs = []
+                # Store current configuration for thread
+                st.session_state.etl_mode = mode
+                st.session_state.etl_compression = compression
+                st.rerun()
+        else:
+            st.button("▶️ Processing...", disabled=True, use_container_width=True)
+    
+    with col2:
+        if st.session_state.processing:
+            if st.button("⏸️ Pause", use_container_width=True):
+                if st.session_state.etl_with_logging:
+                    st.session_state.etl_with_logging.pause()
+                    st.info("⏸️ Pausing... (will pause after current file)")
+        else:
+            st.button("⏸️ Pause", disabled=True, use_container_width=True)
+    
+    with col3:
+        if st.session_state.processing:
+            if st.button("▶️ Resume", use_container_width=True):
+                if st.session_state.etl_with_logging:
+                    st.session_state.etl_with_logging.resume()
+        else:
+            st.button("▶️ Resume", disabled=True, use_container_width=True)
+    
+    with col4:
+        if st.session_state.processing:
+            if st.button("🛑 Cancel", use_container_width=True):
+                if st.session_state.etl_with_logging:
+                    st.session_state.etl_with_logging.cancel()
+                    st.warning("🛑 Cancelling... (will stop after current file)")
+        else:
+            st.button("🛑 Cancel", disabled=True, use_container_width=True)
+    
+    st.markdown("---")
+    
+    # Real-time log display
+    st.subheader("📋 Real-time Logs")
+    
+    log_container = st.container()
+    
     if st.session_state.processing:
-        st.warning("⏳ Processing in progress...")
-    else:
-        if st.button("▶️ Start Processing", type="primary", use_container_width=True):
-            st.session_state.processing = True
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
+        # Run ETL in background
+        def run_etl():
             try:
-                status_text.text("🔍 Discovering files...")
-                progress_bar.progress(20)
+                resume_mode = st.session_state.get('resume_mode', False)
+                etl_mode = st.session_state.get('etl_mode', 'Full Load')
+                etl_compression = st.session_state.get('etl_compression', 'snappy')
                 
-                if mode == "Full Load":
-                    status_text.text("📊 Processing bills...")
-                    progress_bar.progress(40)
-                    st.session_state.etl.process_bills(incremental=False, compression=compression)
-                    
-                    status_text.text("📈 Processing readings...")
-                    progress_bar.progress(70)
-                    st.session_state.etl.process_readings(incremental=False, compression=compression)
+                if etl_mode == "Full Load":
+                    st.session_state.etl_with_logging.run_full_load(
+                        compression=etl_compression,
+                        resume=resume_mode
+                    )
                 else:
-                    status_text.text("🔄 Processing incremental bills...")
-                    progress_bar.progress(40)
-                    st.session_state.etl.process_bills(incremental=True, compression=compression)
-                    
-                    status_text.text("🔄 Processing incremental readings...")
-                    progress_bar.progress(70)
-                    st.session_state.etl.process_readings(incremental=True, compression=compression)
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Complete!")
+                    st.session_state.etl_with_logging.run_incremental_load(
+                        compression=etl_compression,
+                        resume=resume_mode
+                    )
                 
                 st.session_state.last_run = datetime.now()
-                st.success(f"✅ {mode} completed successfully!")
+                st.session_state.resume_mode = False
                 
+            except InterruptedError:
+                # ETL was paused or cancelled
+                pass
             except Exception as e:
-                st.error(f"❌ Error: {str(e)}")
+                st.session_state.etl_logs.append(f"❌ Error: {str(e)}")
+                import traceback
+                st.session_state.etl_logs.append(f"Traceback: {traceback.format_exc()}")
             finally:
                 st.session_state.processing = False
+                st.session_state.checkpoint_exists = check_checkpoint()
+        
+        # Start ETL thread if not already running
+        if st.session_state.etl_thread is None or not st.session_state.etl_thread.is_alive():
+            st.session_state.etl_thread = threading.Thread(target=run_etl, daemon=True)
+            st.session_state.etl_thread.start()
+        
+        # Display logs with auto-refresh
+        with log_container:
+            log_area = st.empty()
+            
+            # Show logs
+            if st.session_state.etl_logs:
+                log_text = "\n".join(st.session_state.etl_logs[-100:])  # Show last 100 logs
+                log_area.code(log_text, language="log")
+            else:
+                log_area.info("⏳ Waiting for logs...")
+            
+            # Auto-refresh every 2 seconds
+            time.sleep(2)
+            st.rerun()
+    
+    else:
+        # Show final logs if available
+        with log_container:
+            if st.session_state.etl_logs:
+                log_text = "\n".join(st.session_state.etl_logs[-100:])
+                st.code(log_text, language="log")
+                
+                if st.session_state.last_run:
+                    st.success(f"✅ Last run completed at {st.session_state.last_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                
+                # Download logs button
+                if st.button("💾 Download Full Logs"):
+                    log_file = Path(st.session_state.target_path) / "etl_pipeline.log"
+                    if log_file.exists():
+                        with open(log_file, 'r') as f:
+                            st.download_button(
+                                label="📥 Download etl_pipeline.log",
+                                data=f.read(),
+                                file_name="etl_pipeline.log",
+                                mime="text/plain"
+                            )
+            else:
+                st.info("ℹ️ No logs available. Start ETL processing to see real-time logs.")
+    
+    # Historical logs viewer
+    st.markdown("---")
+    st.subheader("📜 Historical Logs")
+    
+    log_file = Path(st.session_state.target_path) / "etl_pipeline.log"
+    if log_file.exists():
+        if st.button("📖 View Full Log File"):
+            with open(log_file, 'r') as f:
+                full_logs = f.read()
+                st.text_area("Full Logs", full_logs, height=400)
+    else:
+        st.info("No log file found yet.")
+
+
+elif page == "📋 View Logs":
+    st.title("📋 ETL Logs Viewer")
+    st.markdown("View and analyze ETL pipeline logs")
+    st.markdown("---")
+    
+    log_file = Path(st.session_state.target_path) / "etl_pipeline.log"
+    
+    if not log_file.exists():
+        st.warning("⚠️ No log file found. Run ETL pipeline to generate logs.")
+    else:
+        # File info
+        file_stat = log_file.stat()
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("File Size", f"{file_stat.st_size / 1024:.2f} KB")
+        with col2:
+            st.metric("Last Modified", datetime.fromtimestamp(file_stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"))
+        with col3:
+            with open(log_file, 'r') as f:
+                line_count = sum(1 for _ in f)
+            st.metric("Total Lines", f"{line_count:,}")
+        
+        st.markdown("---")
+        
+        # Filter options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            log_level = st.multiselect(
+                "Filter by Level",
+                ["INFO", "WARNING", "ERROR", "DEBUG"],
+                default=["INFO", "WARNING", "ERROR"]
+            )
+        
+        with col2:
+            search_term = st.text_input("Search logs", placeholder="Enter search term...")
+        
+        # Display options
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            show_lines = st.slider("Number of lines to show", 50, 1000, 200, 50)
+        
+        with col2:
+            show_from = st.radio("Show from", ["End (Latest)", "Beginning"], horizontal=True)
+        
+        st.markdown("---")
+        
+        # Read and display logs
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            all_lines = f.readlines()
+        
+        # Filter by level
+        filtered_lines = []
+        for line in all_lines:
+            if any(level in line for level in log_level):
+                if search_term:
+                    if search_term.lower() in line.lower():
+                        filtered_lines.append(line)
+                else:
+                    filtered_lines.append(line)
+        
+        # Show lines
+        if show_from == "End (Latest)":
+            display_lines = filtered_lines[-show_lines:]
+        else:
+            display_lines = filtered_lines[:show_lines]
+        
+        # Display
+        st.subheader(f"📄 Showing {len(display_lines)} of {len(filtered_lines)} filtered lines")
+        
+        log_text = "".join(display_lines)
+        st.code(log_text, language="log")
+        
+        # Download button
+        st.markdown("---")
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.download_button(
+                label="💾 Download Full Log File",
+                data="".join(all_lines),
+                file_name="etl_pipeline.log",
+                mime="text/plain",
+                use_container_width=True
+            )
+        
+        with col2:
+            st.download_button(
+                label="💾 Download Filtered Logs",
+                data="".join(filtered_lines),
+                file_name="etl_pipeline_filtered.log",
+                mime="text/plain",
+                use_container_width=True
+            )
+        
+        # Log statistics
+        st.markdown("---")
+        st.subheader("📊 Log Statistics")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            info_count = sum(1 for line in all_lines if "INFO" in line)
+            st.metric("INFO", info_count)
+        
+        with col2:
+            warning_count = sum(1 for line in all_lines if "WARNING" in line)
+            st.metric("WARNING", warning_count)
+        
+        with col3:
+            error_count = sum(1 for line in all_lines if "ERROR" in line)
+            st.metric("ERROR", error_count)
+        
+        with col4:
+            debug_count = sum(1 for line in all_lines if "DEBUG" in line)
+            st.metric("DEBUG", debug_count)
+        
+        # Visualization
+        if info_count + warning_count + error_count + debug_count > 0:
+            fig = px.pie(
+                values=[info_count, warning_count, error_count, debug_count],
+                names=["INFO", "WARNING", "ERROR", "DEBUG"],
+                title="Log Level Distribution",
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
 
 elif page == "📅 Scheduler":
     st.title("📅 ETL Scheduler")
@@ -1178,21 +1487,21 @@ elif page == "✅ Validation":
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        duplicates = bills_df['bill_id'].duplicated().sum().compute()
+                        duplicates = safe_compute(bills_df['bill_id'].duplicated().sum())
                         if duplicates == 0:
                             st.success(f"✅ No duplicates")
                         else:
                             st.error(f"❌ {duplicates} duplicates")
                     
                     with col2:
-                        null_count = bills_df['consumption_kwh'].isnull().sum().compute()
+                        null_count = safe_compute(bills_df['consumption_kwh'].isnull().sum())
                         if null_count == 0:
                             st.success(f"✅ No null consumption")
                         else:
                             st.warning(f"⚠️ {null_count} null values")
                     
                     with col3:
-                        negative = (bills_df['total_amount'] <= 0).sum().compute()
+                        negative = safe_compute((bills_df['total_amount'] <= 0).sum())
                         if negative == 0:
                             st.success(f"✅ All amounts valid")
                         else:
@@ -1208,14 +1517,14 @@ elif page == "✅ Validation":
                     col1, col2, col3 = st.columns(3)
                     
                     with col1:
-                        duplicates = readings_df.duplicated(subset=['timestamp', 'meter_id']).sum().compute()
+                        duplicates = safe_compute(readings_df.duplicated(subset=['timestamp', 'meter_id']).sum())
                         if duplicates == 0:
                             st.success(f"✅ No duplicates")
                         else:
                             st.error(f"❌ {duplicates} duplicates")
                     
                     with col2:
-                        sample = readings_df.sample(frac=0.1).compute()
+                        sample = safe_compute(readings_df.sample(frac=0.1))
                         voltage_issues = ((sample['voltage'] < 180) | (sample['voltage'] > 260)).sum()
                         if voltage_issues == 0:
                             st.success(f"✅ Voltage in range")
@@ -1223,7 +1532,7 @@ elif page == "✅ Validation":
                             st.warning(f"⚠️ {voltage_issues} voltage issues")
                     
                     with col3:
-                        negative = (readings_df['consumption_kwh'] < 0).sum().compute()
+                        negative = safe_compute((readings_df['consumption_kwh'] < 0).sum())
                         if negative == 0:
                             st.success(f"✅ All consumption valid")
                         else:
