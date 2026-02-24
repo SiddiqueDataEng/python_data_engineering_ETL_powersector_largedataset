@@ -5,6 +5,7 @@ Data Explorer - Interactive tool to query and analyze processed data
 import pandas as pd
 import dask.dataframe as dd
 from pathlib import Path
+from parquet_utils import read_parquet_safe
 
 
 class DataExplorer:
@@ -20,10 +21,16 @@ class DataExplorer:
         self.readings = None
         
         if self.bills_path.exists():
-            self.bills = dd.read_parquet(self.bills_path)
+            try:
+                self.bills = read_parquet_safe(self.bills_path)
+            except Exception as e:
+                print(f"Warning: Could not load bills data: {e}")
         
         if self.readings_path.exists():
-            self.readings = dd.read_parquet(self.readings_path)
+            try:
+                self.readings = read_parquet_safe(self.readings_path)
+            except Exception as e:
+                print(f"Warning: Could not load readings data: {e}")
     
     def show_overview(self):
         """Display data overview"""

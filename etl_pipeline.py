@@ -24,12 +24,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def read_parquet_safe(path: Path) -> dd.DataFrame:
+    """
+    Safely read parquet files from a directory.
+    Handles both single files and partitioned directories.
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Path does not exist: {path}")
+    
+    if path.is_dir():
+        # Try to read partitioned parquet files
+        pattern = str(path / "*.parquet")
+        return dd.read_parquet(pattern)
+    else:
+        # Single file
+        return dd.read_parquet(str(path))
+
+
 class PowerSectorETL:
     """ETL Pipeline for Power Sector Data with CDC support"""
     
     def __init__(
         self,
-        source_dir: str = r"\\counter2\E\iesco\power_sector_data",
+        source_dir: str = "power_sector_data_bronze_layer",
         target_dir: str = "power_sector_data_silver_layer",
         state_file: str = "etl_state.json"
     ):
@@ -99,12 +116,20 @@ class PowerSectorETL:
                     continue
                 
                 file_path = data_dir / pattern
+                
+                # Check if file actually exists
                 if not file_path.exists():
+                    logger.debug(f"File not found: {file_path}")
                     continue
                 
                 # CDC: Check if file needs processing
                 file_key = str(file_path.relative_to(self.source_dir))
-                file_hash = self._get_file_hash(file_path)
+                
+                try:
+                    file_hash = self._get_file_hash(file_path)
+                except Exception as e:
+                    logger.warning(f"Could not hash file {file_path}: {e}")
+                    continue
                 
                 if incremental:
                     # Skip if already processed and unchanged
@@ -190,6 +215,11 @@ class PowerSectorETL:
         dfs = []
         for file_path, division, subdivision in files_to_process:
             try:
+                # Verify file exists before reading
+                if not file_path.exists():
+                    logger.warning(f"File not found, skipping: {file_path}")
+                    continue
+                
                 logger.info(f"Reading: {file_path}")
                 df = dd.read_csv(
                     file_path,
@@ -211,6 +241,9 @@ class PowerSectorETL:
                 
                 dfs.append(df)
                 
+            except FileNotFoundError as e:
+                logger.warning(f"File not found, skipping: {file_path}")
+                continue
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
                 continue
@@ -232,20 +265,44 @@ class PowerSectorETL:
         # Handle incremental vs full load
         if incremental and output_path.exists():
             logger.info("Merging with existing bills data...")
-            existing_df = dd.read_parquet(output_path)
-            combined_df = dd.concat([existing_df, combined_df], ignore_index=True)
-            combined_df = combined_df.drop_duplicates(subset=['bill_id'], keep='last')
+            try:
+                # Try to read existing parquet data
+                existing_df = read_parquet_safe(output_path)
+                combined_df = dd.concat([existing_df, combined_df], ignore_index=True)
+                combined_df = combined_df.drop_duplicates(subset=['bill_id'], keep='last')
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Could not read existing data: {e}. Performing full load instead.")
+                # Continue with just the new data
         
         # Write to Parquet with compression
         logger.info(f"Writing bills to {output_path}...")
-        with ProgressBar():
-            combined_df.to_parquet(
-                output_path,
+        
+        # Extreme memory constraint workaround: Write partitions one by one
+        logger.info(f"Writing {combined_df.npartitions} partitions one by one (memory-safe mode)...")
+        
+        import shutil
+        if output_path.exists():
+            shutil.rmtree(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Write each partition separately
+        for i in range(combined_df.npartitions):
+            partition = combined_df.get_partition(i)
+            part_file = output_path / f"part.{i}.parquet"
+            
+            # Compute and write this partition only
+            partition_df = partition.compute()
+            partition_df.to_parquet(
+                part_file,
                 engine='pyarrow',
                 compression=compression,
-                write_index=False,
-                overwrite=True
+                index=False
             )
+            
+            if (i + 1) % 10 == 0 or i == combined_df.npartitions - 1:
+                logger.info(f"  Written {i + 1}/{combined_df.npartitions} partitions...")
+        
+        logger.info(f"✓ All partitions written to {output_path}")
         
         # Update state
         self.state['last_incremental_load' if incremental else 'last_full_load'] = datetime.now().isoformat()
@@ -279,6 +336,11 @@ class PowerSectorETL:
         dfs = []
         for file_path, division, subdivision in files_to_process:
             try:
+                # Verify file exists before reading
+                if not file_path.exists():
+                    logger.warning(f"File not found, skipping: {file_path}")
+                    continue
+                
                 logger.info(f"Reading: {file_path}")
                 df = dd.read_csv(
                     file_path,
@@ -298,6 +360,9 @@ class PowerSectorETL:
                 
                 dfs.append(df)
                 
+            except FileNotFoundError as e:
+                logger.warning(f"File not found, skipping: {file_path}")
+                continue
             except Exception as e:
                 logger.error(f"Error reading {file_path}: {e}")
                 continue
@@ -319,23 +384,48 @@ class PowerSectorETL:
         # Handle incremental vs full load
         if incremental and output_path.exists():
             logger.info("Merging with existing readings data...")
-            existing_df = dd.read_parquet(output_path)
-            combined_df = dd.concat([existing_df, combined_df], ignore_index=True)
-            combined_df = combined_df.drop_duplicates(
-                subset=['timestamp', 'meter_id'],
-                keep='last'
-            )
+            try:
+                # Try to read existing parquet data
+                existing_df = read_parquet_safe(output_path)
+                combined_df = dd.concat([existing_df, combined_df], ignore_index=True)
+                combined_df = combined_df.drop_duplicates(
+                    subset=['timestamp', 'meter_id'],
+                    keep='last'
+                )
+            except (ValueError, FileNotFoundError) as e:
+                logger.warning(f"Could not read existing data: {e}. Performing full load instead.")
+                # Continue with just the new data
         
         # Write to Parquet with compression and partitioning
         logger.info(f"Writing readings to {output_path}...")
-        with ProgressBar():
-            combined_df.to_parquet(
-                output_path,
+        
+        # Extreme memory constraint workaround: Write partitions one by one
+        # This avoids any internal shuffling by Dask
+        logger.info(f"Writing {combined_df.npartitions} partitions one by one (memory-safe mode)...")
+        
+        import shutil
+        if output_path.exists():
+            shutil.rmtree(output_path)
+        output_path.mkdir(parents=True, exist_ok=True)
+        
+        # Write each partition separately
+        for i in range(combined_df.npartitions):
+            partition = combined_df.get_partition(i)
+            part_file = output_path / f"part.{i}.parquet"
+            
+            # Compute and write this partition only
+            partition_df = partition.compute()
+            partition_df.to_parquet(
+                part_file,
                 engine='pyarrow',
                 compression=compression,
-                write_index=False,
-                overwrite=True
+                index=False
             )
+            
+            if (i + 1) % 10 == 0 or i == combined_df.npartitions - 1:
+                logger.info(f"  Written {i + 1}/{combined_df.npartitions} partitions...")
+        
+        logger.info(f"✓ All partitions written to {output_path}")
         
         # Update state
         self.state['last_incremental_load' if incremental else 'last_full_load'] = datetime.now().isoformat()
@@ -396,30 +486,36 @@ class PowerSectorETL:
         readings_path = self.target_dir / "readings.parquet"
         
         if bills_path.exists():
-            bills_df = dd.read_parquet(bills_path)
-            stats['bills'] = {
-                'total_records': len(bills_df),
-                'file_size_mb': bills_path.stat().st_size / (1024 * 1024),
-                'divisions': bills_df['division'].nunique().compute(),
-                'subdivisions': bills_df['subdivision'].nunique().compute(),
-                'date_range': (
-                    bills_df['billing_month'].min().compute(),
-                    bills_df['billing_month'].max().compute()
-                )
-            }
+            try:
+                bills_df = read_parquet_safe(bills_path)
+                stats['bills'] = {
+                    'total_records': len(bills_df),
+                    'file_size_mb': sum(f.stat().st_size for f in bills_path.glob("*.parquet")) / (1024 * 1024),
+                    'divisions': bills_df['division'].nunique().compute(),
+                    'subdivisions': bills_df['subdivision'].nunique().compute(),
+                    'date_range': (
+                        bills_df['billing_month'].min().compute(),
+                        bills_df['billing_month'].max().compute()
+                    )
+                }
+            except Exception as e:
+                logger.warning(f"Could not read bills statistics: {e}")
         
         if readings_path.exists():
-            readings_df = dd.read_parquet(readings_path)
-            stats['readings'] = {
-                'total_records': len(readings_df),
-                'file_size_mb': readings_path.stat().st_size / (1024 * 1024),
-                'divisions': readings_df['division'].nunique().compute(),
-                'subdivisions': readings_df['subdivision'].nunique().compute(),
-                'date_range': (
-                    readings_df['timestamp'].min().compute(),
-                    readings_df['timestamp'].max().compute()
-                )
-            }
+            try:
+                readings_df = read_parquet_safe(readings_path)
+                stats['readings'] = {
+                    'total_records': len(readings_df),
+                    'file_size_mb': sum(f.stat().st_size for f in readings_path.glob("*.parquet")) / (1024 * 1024),
+                    'divisions': readings_df['division'].nunique().compute(),
+                    'subdivisions': readings_df['subdivision'].nunique().compute(),
+                    'date_range': (
+                        readings_df['timestamp'].min().compute(),
+                        readings_df['timestamp'].max().compute()
+                    )
+                }
+            except Exception as e:
+                logger.warning(f"Could not read readings statistics: {e}")
         
         return stats
 
@@ -443,7 +539,7 @@ def main():
     )
     parser.add_argument(
         '--source',
-        default=r'\\counter2\E\iesco\power_sector_data',
+        default='power_sector_data_bronze_layer',
         help='Source data directory'
     )
     parser.add_argument(
